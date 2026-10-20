@@ -4,6 +4,7 @@ import io
 import fitz  # PyMuPDF
 import unicodedata
 import re
+from difflib import SequenceMatcher
 
 st.set_page_config(page_title="ProgramaDeFiacosos", page_icon="💸", layout="wide")
 
@@ -18,7 +19,7 @@ def parsear_monto(val):
     if pd.isna(val):
         return 0.0
     s = str(val).strip().replace("$", "").replace("\xa0", "").strip()
-    if not s:
+    if not s or "total" in s.lower() or "suma" in s.lower():
         return 0.0
     if "," in s:
         s = s.replace(".", "").replace(",", ".")
@@ -35,6 +36,9 @@ def normalizar_texto(texto):
     nfkd = unicodedata.normalize('NFKD', str(texto).upper())
     sin_tildes = "".join([c for c in nfkd if not unicodedata.combining(c)])
     return sin_tildes.replace("Ñ", "N")
+
+def calcular_similitud(a, b):
+    return SequenceMatcher(None, a, b).ratio()
 
 def extraer_datos_pagina(texto_pag):
     monto_encontrado = "No detectado"
@@ -60,7 +64,7 @@ def extraer_datos_pagina(texto_pag):
                     
     return titular_encontrado, monto_encontrado
 
-# --- SECCIÓN 1: CARGAR EL LISTADO DE PERSONAS ---
+# --- SECCIÓN 1: CARGAR EL LISTADO DE PERSONAS (INTACTO Y SEGURO) ---
 st.markdown("### 1. Cargar el listado de personas / transferencias")
 
 tab1, tab2 = st.tabs(["📋 Pegar datos desde Excel", "📁 Subir archivo Excel/CSV"])
@@ -112,7 +116,8 @@ with tab2:
             else:
                 xls = pd.ExcelFile(uploaded_excel)
                 hojas_disponibles = xls.sheet_names
-                hoja_seleccionada = st.selectbox("📌 Seleccioná la hoja que querés procesar:", hojas_disponibles, key=f"sheet_sel_{rc}")
+                hoja_sugerida = next((h for h in hojas_disponibles if "total" in h.lower()), hojas_disponibles[0])
+                hoja_seleccionada = st.selectbox("📌 Seleccioná la hoja que querés procesar:", hojas_disponibles, index=hojas_disponibles.index(hoja_sugerida), key=f"sheet_sel_{rc}")
                 
                 if hoja_seleccionada:
                     df_raw = pd.read_excel(xls, sheet_name=hoja_seleccionada, header=None)
@@ -147,7 +152,7 @@ with tab2:
                         
                         cols_a_conservar = [c for c in [col_cuit, col_nombre, col_monto] if c is not None]
                         if cols_a_conservar:
-                            df_filtrado = df_datos[cols_a_conservar].dropna(how="all").copy()
+                            df_filtrado = df_datos.dropna(subset=[col_cuit]).copy()
                             if col_cuit:
                                 df_filtrado[col_cuit] = df_filtrado[col_cuit].astype(str).str.replace(".0", "", regex=False).str.strip()
                                 df_filtrado = df_filtrado[~df_filtrado[col_cuit].str.upper().str.contains("TOTAL|SUMA|SUBTOTAL|NAN", na=False)]
@@ -155,6 +160,8 @@ with tab2:
                                 df_filtrado = df_filtrado[~df_filtrado[col_nombre].astype(str).str.upper().str.contains("TOTAL|SUMA|SUBTOTAL", na=False)]
                             if col_monto:
                                 df_filtrado[col_monto] = df_filtrado[col_monto].apply(parsear_monto)
+                            
+                            df_filtrado = df_filtrado[df_filtrado[col_monto] > 0]
                             
                             if col_cuit and col_monto and df_filtrado[col_cuit].duplicated().any():
                                 st.info("ℹ️ Se detectaron registros repetidos. Agrupando y sumando montos por CUIT...")
@@ -206,14 +213,14 @@ if uploaded_pdf is not None:
 
 st.divider()
 
-# --- SECCIÓN 3: PROCESAMIENTO HÍBRIDO ---
+# --- SECCIÓN 3: PROCESAMIENTO HÍBRIDO MULTICAPA (OPCIÓN 3) ---
 if st.button("🚀 Procesar Comprobantes", type="primary"):
     if df_listado is None:
         st.warning("⚠️ Primero cargá o pegá el listado de personas a buscar.")
     elif uploaded_pdf is None:
         st.warning("⚠️ Primero subí el archivo PDF con los comprobantes.")
     else:
-        with st.spinner("Analizando comprobantes..."):
+        with st.spinner("Analizando comprobantes con sistema multicapa inteligente..."):
             try:
                 pdf_bytes = uploaded_pdf.read()
                 doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -235,6 +242,7 @@ if st.button("🚀 Procesar Comprobantes", type="primary"):
                     monto_entero_str = str(int(monto_val)) if monto_val > 0 else ""
                     hallado = False
                     
+                    # --- CAPA 1: MATCH PERFECTO (Nombre exacto + Monto) ---
                     for num_pag, texto_norm in textos_paginas:
                         texto_limpio = texto_norm.replace(".", "").replace(",", "")
                         
@@ -264,6 +272,30 @@ if st.button("🚀 Procesar Comprobantes", type="primary"):
                             })
                             break
                     
+                    # --- CAPA 2: RESCATE INTELIGENTE (Anclaje por Monto Exacto + Similitud Tipográfica / Fuzzy) ---
+                    if not hallado and monto_entero_str:
+                        for num_pag, texto_norm in textos_paginas:
+                            texto_limpio = texto_norm.replace(".", "").replace(",", "")
+                            if monto_entero_str in texto_limpio:
+                                # El monto coincide exactamente en esta página. Extraemos el titular del PDF para comparar.
+                                titular_pdf, _ = extraer_datos_pagina(doc[num_pag].get_text("text"))
+                                titular_pdf_norm = normalizar_texto(titular_pdf)
+                                
+                                # Comparamos similitud de texto (umbral del 50% para absorber FERRIRA/Ferreira, LEGIZAMON/Leguizamon, etc.)
+                                similitud = calcular_similitud(nombre_norm, titular_pdf_norm)
+                                if similitud >= 0.50 or any(p in titular_pdf_norm for p in re.findall(r'\b\w+\b', nombre_norm) if len(p) > 3):
+                                    hallado = True
+                                    encontrados.append({
+                                        "df_idx": idx,
+                                        "CUIT": cuit_orig,
+                                        "Nombre": nombre_orig,
+                                        "Monto": f"$ {monto_val:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+                                        "Página PDF": num_pag + 1,
+                                        "Pag_Index": num_pag
+                                    })
+                                    break
+                    
+                    # --- CAPA 3: NO ENCONTRADO (Generar sugerencias o revisión manual) ---
                     if not hallado:
                         sugerencia_pag = None
                         titular_en_pdf = ""
