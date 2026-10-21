@@ -1,567 +1,456 @@
 import streamlit as st
 import pandas as pd
-import io
-import fitz  # PyMuPDF
 import unicodedata
 import re
-import zipfile
+import fitz  # PyMuPDF
 from difflib import SequenceMatcher
+import zipfile
+import io
 
-# Configuración de página con el nombre oficial V2
-st.set_page_config(page_title="Ayuda vagos 3002 😎", page_icon="💸", layout="wide")
+# Configuración de página
+st.set_page_config(
+    page_title="Ayuda vagos PRO MAX 🚀", 
+    page_icon="🚀", 
+    layout="wide"
+)
 
-st.title("Ayuda vagos 3002 😎")
-st.subheader("Extractor automático de comprobantes de transferencia (Procesamiento por Lotes y Manual)")
+st.title("Ayuda vagos PRO MAX 🚀")
+st.subheader("Extractor de comprobantes de Recuperadores independientes")
+
+SPREADSHEET_ID = "1LSYGE6PcvjaaYlgHK3iw6_WneP-jTcBG8S9fdfDMxFA"
+CSV_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export?format=csv"
+SHEET_PUBLIC_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit?usp=sharing"
 
 if "reset_count" not in st.session_state:
     st.session_state["reset_count"] = 0
 
+rc = st.session_state["reset_count"]
+
 def parsear_monto(val):
+    """Parsea montos en formato argentino a float puro evitando truncamientos."""
     if pd.isna(val):
         return 0.0
     s = str(val).strip().replace("$", "").replace("\xa0", "").strip()
     if not s or "total" in s.lower() or "suma" in s.lower():
         return 0.0
-    if "," in s:
+    
+    if "." in s and "," in s:
         s = s.replace(".", "").replace(",", ".")
-    elif s.count(".") > 1:
-        s = s.replace(".", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+    elif "." in s:
+        partes = s.split(".")
+        if len(partes[-1]) == 3 or len(partes) > 2:
+            s = s.replace(".", "")
+            
     try:
         return float(s)
     except:
         return 0.0
+
+def formatear_monto_ar(val):
+    """Formatea float a formato moneda argentina: 61200.0 -> $ 61.200,00"""
+    return f"$ {val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def normalizar_texto(texto):
     if not texto:
         return ""
     nfkd = unicodedata.normalize('NFKD', str(texto).upper())
     sin_tildes = "".join([c for c in nfkd if not unicodedata.combining(c)])
-    return sin_tildes.replace("Ñ", "N")
+    return re.sub(r'[^A-Z0-9\s]', '', sin_tildes).strip()
 
-def calcular_similitud(a, b):
-    return SequenceMatcher(None, a, b).ratio()
+def similar_palabra_banco(p_planilla, p_pdf):
+    """Verifica si una palabra del nombre coincide o es muy similar (ej: HERNAN vs HERNN)"""
+    if p_planilla in p_pdf or p_pdf in p_planilla:
+        return True
+    return SequenceMatcher(None, p_planilla, p_pdf).ratio() >= 0.80
 
-def extraer_datos_pagina(texto_pag):
-    monto_encontrado = "No detectado"
-    titular_encontrado = "No detectado"
-    
-    match_monto = re.search(r"IMPORTE DE LA TRANSFERENCIA:\s*\$?([\d\.,]+)", texto_pag, re.IGNORECASE)
-    if match_monto:
-        monto_encontrado = match_monto.group(1).strip()
+@st.cache_data(ttl=300)
+def cargar_datos_google_sheets(url):
+    try:
+        df_raw = pd.read_csv(url, header=None, dtype=str)
+        if df_raw.empty:
+            return pd.DataFrame()
+
+        fila_encabezado = None
+        for idx, row in df_raw.head(10).iterrows():
+            texto_fila = " ".join([str(val).lower() for val in row.values if pd.notna(val)])
+            if "cuit" in texto_fila and ("fecha" in texto_fila or "unidad" in texto_fila):
+                fila_encabezado = idx
+                break
         
-    lineas = [l.strip() for l in texto_pag.split("\n") if l.strip()]
-    for i, linea in enumerate(lineas):
-        if "BENEFICIARIO:" in linea.upper() or "TITULAR" in linea.upper():
-            if ":" in linea:
-                partes = linea.split(":")
-                if len(partes) > 1 and len(partes[1].strip()) > 3:
-                    titular_encontrado = partes[1].strip()
-                    break
-            if i + 1 < len(lineas):
-                posible_nombre = lineas[i + 1]
-                if posible_nombre and not posible_nombre.startswith("FAC") and len(posible_nombre) > 3:
-                    titular_encontrado = posible_nombre
-                    break
-                    
-    return titular_encontrado, monto_encontrado
+        if fila_encabezado is None:
+            return pd.DataFrame()
 
-def extraer_unidad_productiva(df_raw):
-    for r in range(min(5, len(df_raw))):
-        fila = df_raw.iloc[r].tolist()
-        for c, val in enumerate(fila):
-            val_str = str(val).strip().lower()
-            if "unidad productiva" in val_str:
-                if c + 1 < len(fila) and pd.notna(fila[c + 1]):
-                    nombre_up = str(fila[c + 1]).strip()
-                    if nombre_up and nombre_up.lower() != "nan":
-                        return nombre_up
-    return ""
+        df_clean = pd.read_csv(url, header=fila_encabezado, dtype=str)
+        df_clean.columns = [str(c).strip() for c in df_clean.columns]
+        
+        col_fecha = next((c for c in df_clean.columns if "fecha" in c.lower()), None)
+        col_up = next((c for c in df_clean.columns if "unidad" in c.lower() or "up" in c.lower()), None)
+        col_cuit = next((c for c in df_clean.columns if "cuit" in c.lower()), None)
+        col_nombre = next((c for c in df_clean.columns if "apellido" in c.lower() or "nombre" in c.lower()), None)
+        col_monto = next((c for c in df_clean.columns if "total" in c.lower() or "monto" in c.lower()), None)
+        
+        if not all([col_fecha, col_up, col_cuit, col_nombre, col_monto]):
+            return pd.DataFrame()
+            
+        df_final = df_clean[[col_fecha, col_up, col_cuit, col_nombre, col_monto]].copy()
+        df_final.columns = ["Fecha", "Unidad_Productiva", "CUIT", "Nombre", "Monto"]
+        
+        df_final = df_final.dropna(subset=["CUIT", "Fecha"]).copy()
+        df_final["CUIT"] = df_final["CUIT"].astype(str).str.replace(".0", "", regex=False).str.strip()
+        df_final["Unidad_Productiva"] = df_final["Unidad_Productiva"].astype(str).str.strip()
+        df_final["Nombre"] = df_final["Nombre"].astype(str).str.strip()
+        df_final["Monto"] = df_final["Monto"].apply(parsear_monto)
+        df_final["Fecha"] = df_final["Fecha"].astype(str).str.strip()
+        
+        df_final = df_final[~df_final["CUIT"].str.upper().str.contains("TOTAL|SUMA|NAN|UNIDAD", na=False)]
+        df_final = df_final[df_final["Monto"] > 0]
+        
+        return df_final
+    except Exception as e:
+        return pd.DataFrame()
 
 def extraer_fecha_pago_pdf(doc):
     for i in range(min(5, len(doc))):
         texto = doc[i].get_text("text")
-        match = re.search(r"Fecha de Pago:\s*([\d{2}/]+)", texto, re.IGNORECASE)
+        match = re.search(r"Fecha de Pago:\s*([\d{2}/-]+)", texto, re.IGNORECASE)
         if match:
-            return match.group(1).replace("/", "-").strip()
-        match_fecha = re.search(r"(\d{2}/\d{2}/\d{4})", texto)
+            return match.group(1).replace("-", "/").strip()
+        match_fecha = re.search(r"(\d{2}[/-]\d{2}[/-]\d{4})", texto)
         if match_fecha:
-            return match_fecha.group(1).replace("/", "-").strip()
-    return "Fecha_Desconocida"
+            return match_fecha.group(1).replace("-", "/").strip()
+    return None
 
-def procesar_hoja_excel(xls, hoja_seleccionada):
-    df_raw = pd.read_excel(xls, sheet_name=hoja_seleccionada, header=None)
-    unidad_productiva = extraer_unidad_productiva(df_raw)
-    
-    fila_encabezado = None
-    for idx, row in df_raw.iterrows():
-        texto_fila = " ".join([str(val).lower() for val in row.values])
-        if "cuit" in texto_fila and ("nombre" in texto_fila or "apellido" in texto_fila):
-            fila_encabezado = idx
-            break
-            
-    if fila_encabezado is None:
-        return None, unidad_productiva
-
-    raw_headers = df_raw.iloc[fila_encabezado].tolist()
-    headers = []
-    seen = {}
-    for h in raw_headers:
-        h_str = str(h).strip()
-        if not h_str or h_str.lower() in ["nan", "none"]:
-            h_str = "Col_Vacia"
-        if h_str in seen:
-            seen[h_str] += 1
-            h_str = f"{h_str}_{seen[h_str]}"
-        else:
-            seen[h_str] = 0
-        headers.append(h_str)
-
-    df_datos = df_raw.iloc[fila_encabezado + 1:].copy()
-    df_datos.columns = headers
-
-    col_cuit = next((c for c in df_datos.columns if "cuit" in c.lower()), None)
-    col_nombre = next((c for c in df_datos.columns if "apellido" in c.lower() or "nombre" in c.lower()), None)
-    col_monto = next((c for c in df_datos.columns if any(m in c.lower() for m in ["monto", "valorizado", "total"])), None)
-
-    cols_a_conservar = [c for c in [col_cuit, col_nombre, col_monto] if c is not None]
-    if not cols_a_conservar:
-        return None, unidad_productiva
-
-    df_filtrado = df_datos.dropna(subset=[col_cuit]).copy()
-    if col_cuit:
-        df_filtrado[col_cuit] = df_filtrado[col_cuit].astype(str).str.replace(".0", "", regex=False).str.strip()
-        df_filtrado = df_filtrado[~df_filtrado[col_cuit].str.upper().str.contains("TOTAL|SUMA|SUBTOTAL|NAN", na=False)]
-    if col_nombre:
-        df_filtrado = df_filtrado[~df_filtrado[col_nombre].astype(str).str.upper().str.contains("TOTAL|SUMA|SUBTOTAL", na=False)]
-    if col_monto:
-        df_filtrado[col_monto] = df_filtrado[col_monto].apply(parsear_monto)
-
-    df_filtrado = df_filtrado[df_filtrado[col_monto] > 0]
-
-    if col_cuit and col_monto and df_filtrado[col_cuit].duplicated().any():
-        dic_agrupacion = {col_nombre: "first"} if col_nombre else {}
-        dic_agrupacion[col_monto] = "sum"
-        df_filtrado = df_filtrado.groupby(col_cuit, as_index=False).agg(dic_agrupacion)
-    elif col_cuit:
-        df_filtrado = df_filtrado.drop_duplicates(subset=[col_cuit])
-
-    mapeo_renombre = {}
-    if col_cuit: mapeo_renombre[col_cuit] = "CUIT"
-    if col_nombre: mapeo_renombre[col_nombre] = "Nombre"
-    if col_monto: mapeo_renombre[col_monto] = "Monto"
-    df_filtrado = df_filtrado.rename(columns=mapeo_renombre)
-
-    return df_filtrado, unidad_productiva
-
-config_columnas = {
-    "#": st.column_config.Column("#", width=40),
-    "CUIT": st.column_config.TextColumn("CUIT", width=150),
-    "Nombre": st.column_config.TextColumn("Nombre", width=300),
-    "Monto": st.column_config.TextColumn("Monto", width=150),
-    "Página PDF": st.column_config.NumberColumn("Página PDF", width=100, format="%d")
-}
-
-rc = st.session_state["reset_count"]
-
-# --- SECCIÓN 1: SELECCIÓN DE MODO (LOTE O MANUAL) ---
-st.markdown("### 1. Cargar el listado de personas / transferencias")
-
-modo_carga = st.radio(
-    "Seleccioná el método de carga:", 
-    ["📁 Carga Múltiple de Excels (Lote)", "📋 Pegar datos manualmente"],
-    horizontal=True,
-    key=f"modo_carga_{rc}"
-)
-
-dict_lotes = {}
-uploaded_pdf = None
-
-if modo_carga == "📁 Carga Múltiple de Excels (Lote)":
-    col_l1, col_l2 = st.columns(2)
-    with col_l1:
-        uploaded_excels = st.file_uploader(
-            "📁 Subí una o varias planillas Excel/CSV", 
-            type=["xlsx", "xls", "csv"], 
-            accept_multiple_files=True,
-            key=f"excel_uploader_{rc}"
-        )
-    with col_l2:
-        uploaded_pdf = st.file_uploader(
-            "📄 Subí el PDF único con los comprobantes", 
-            type=["pdf"], 
-            key=f"pdf_uploader_{rc}"
-        )
-
-    if uploaded_excels:
-        st.markdown("#### 📋 Configuración de Planillas Cargadas")
-        for idx_file, excel_file in enumerate(uploaded_excels):
-            with st.expander(f"📄 Archivo: **{excel_file.name}**", expanded=True):
-                if excel_file.name.endswith('.csv'):
-                    df_parsed = pd.read_csv(excel_file)
-                    unit_name = excel_file.name.replace(".csv", "")
-                else:
-                    xls = pd.ExcelFile(excel_file)
-                    hojas = xls.sheet_names
-                    hoja_def = next((h for h in hojas if "total" in h.lower()), hojas[0])
-                    
-                    c_hoja, c_up = st.columns([2, 2])
-                    with c_hoja:
-                        hoja_sel = st.selectbox(
-                            f"Hoja a procesar ({excel_file.name}):", 
-                            hojas, 
-                            index=hojas.index(hoja_def), 
-                            key=f"sel_hoja_{idx_file}_{rc}"
-                        )
-                    
-                    df_parsed, up_detectada = procesar_hoja_excel(xls, hoja_sel)
-                    
-                    with c_up:
-                        label_up = "Nombre Unidad Productiva ⚠️ (Requerido)" if not up_detectada else "Nombre Unidad Productiva:"
-                        unit_name = st.text_input(
-                            label_up, 
-                            value=up_detectada, 
-                            key=f"up_input_{idx_file}_{rc}"
-                        )
-                        if not unit_name.strip():
-                            st.markdown("<span style='color:red; font-size:12px;'>⚠️ Asigná un nombre para identificar esta Unidad Productiva.</span>", unsafe_allow_html=True)
-                
-                if df_parsed is not None and not df_parsed.empty:
-                    final_name = unit_name.strip() if unit_name.strip() else f"Lote_{idx_file+1}"
-                    dict_lotes[excel_file.name] = {
-                        "df": df_parsed,
-                        "unidad_productiva": final_name,
-                        "file_name": excel_file.name
-                    }
-                    df_vis = df_parsed.copy().reset_index(drop=True)
-                    df_vis.insert(0, "#", range(1, len(df_vis) + 1))
-                    df_vis["Monto"] = df_vis["Monto"].apply(lambda x: f"$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-                    st.dataframe(df_vis, use_container_width=True, hide_index=True, column_config=config_columnas)
-                else:
-                    st.error("No se pudieron extraer datos válidos de este archivo.")
-
-else: # Modo Manual / Pegar datos
-    col_m1, col_m2 = st.columns(2)
-    with col_m1:
-        pasted_text = st.text_area(
-            "Pegá aquí las celdas copiadas de Excel (CUIT \t Nombre \t Monto):",
-            height=150,
-            placeholder="20-12345678-9\tJuan Perez\t15000",
-            key=f"pasted_area_{rc}"
-        )
-        unit_manual = st.text_input("Nombre de la Unidad Productiva:", value="General", key=f"up_manual_{rc}")
-    with col_m2:
-        uploaded_pdf = st.file_uploader(
-            "📄 Subí el archivo PDF con los comprobantes", 
-            type=["pdf"], 
-            key=f"pdf_uploader_manual_{rc}"
-        )
-    
-    if pasted_text.strip():
+def normalizar_fecha_busqueda(fecha_str):
+    if not fecha_str:
+        return ""
+    partes = fecha_str.replace("-", "/").split("/")
+    if len(partes) == 3:
         try:
-            df_temp = pd.read_csv(io.StringIO(pasted_text.strip()), sep="\t", header=None)
-            columnas_estandar = ["CUIT", "Nombre", "Monto"]
-            num_cols = df_temp.shape[1]
-            if num_cols <= 3:
-                df_temp.columns = columnas_estandar[:num_cols]
-            else:
-                df_temp.columns = columnas_estandar + [f"Columna_{i+1}" for i in range(3, num_cols)]
-            
-            df_temp["CUIT"] = df_temp["CUIT"].astype(str).str.replace(".0", "", regex=False).str.strip()
-            if "Monto" in df_temp.columns:
-                df_temp["Monto"] = df_temp["Monto"].apply(parsear_monto)
-            
-            dict_lotes["manual_input"] = {
-                "df": df_temp,
-                "unidad_productiva": unit_manual.strip() if unit_manual.strip() else "General",
-                "file_name": "Pegado Manual"
-            }
-            st.success("¡Datos manuales cargados correctamente!")
-        except Exception as e:
-            st.error(f"No se pudieron interpretar los datos pegados: {e}")
+            d = str(int(partes[0]))
+            m = str(int(partes[1]))
+            a = partes[2]
+            return f"{d}/{m}/{a}"
+        except:
+            pass
+    return fecha_str
+
+def sanitizar_texto_archivo(texto):
+    return str(texto).replace("/", "-").replace("\\", "-").replace(":", "-").strip()
+
+def generar_pdf_individual_bytes(doc, pag_idx):
+    single_doc = fitz.open()
+    single_doc.insert_pdf(doc, from_page=pag_idx, to_page=pag_idx)
+    pdf_bytes = single_doc.write()
+    single_doc.close()
+    return pdf_bytes
+
+def generar_pdf_unificado_bytes(doc, lista_pag_indices):
+    uni_doc = fitz.open()
+    for p_idx in lista_pag_indices:
+        uni_doc.insert_pdf(doc, from_page=p_idx, to_page=p_idx)
+    pdf_bytes = uni_doc.write()
+    uni_doc.close()
+    return pdf_bytes
+
+# --- MÓDULO 1 ---
+c_link, c_ref, _ = st.columns([2, 1, 3])
+with c_link:
+    st.link_button("📊 Abrir Planilla Maestra en Google Sheets", SHEET_PUBLIC_URL)
+with c_ref:
+    if st.button("🔄 Sincronizar"):
+        st.cache_data.clear()
+        st.rerun()
+
+with st.spinner("Sincronizando con Google Sheets..."):
+    df_master = cargar_datos_google_sheets(CSV_URL)
+
+if df_master.empty:
+    st.error("⚠️ No se pudieron sincronizar los datos de la planilla maestra.")
+    st.stop()
+else:
+    st.success(f"✅ Conexión exitosa. Se sincronizaron **{len(df_master)} registros** desde la nube.")
 
 st.divider()
 
-# --- SECCIÓN 2: PROCESAMIENTO MULTICAPA INTELIGENTE ---
-if st.button("🚀 Procesar Comprobantes", type="primary"):
-    if not dict_lotes:
-        st.warning("⚠️ Primero cargá o pegá los datos del listado.")
-    elif uploaded_pdf is None:
-        st.warning("⚠️ Primero subí el archivo PDF con los comprobantes.")
-    else:
-        with st.spinner("Procesando lotes con el motor multicapa inteligente..."):
-            try:
-                pdf_bytes = uploaded_pdf.read()
-                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                fecha_pago = extraer_fecha_pago_pdf(doc)
+# --- MÓDULO 2 ---
+st.markdown("### Carga de PDF unificado")
+uploaded_pdf = st.file_uploader("Cargá el pdf con los comprobantes de transferencia", type=["pdf"], key=f"pdf_up_{rc}")
+
+ups_seleccionadas = []
+fecha_busqueda = ""
+fecha_display = ""
+doc = None
+df_fecha = pd.DataFrame()
+
+if uploaded_pdf is not None:
+    try:
+        pdf_bytes = uploaded_pdf.read()
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        
+        fecha_detectada = extraer_fecha_pago_pdf(doc)
+        
+        if not fecha_detectada:
+            st.warning("⚠️ No se pudo detectar automáticamente la Fecha de Pago en el PDF.")
+        else:
+            fecha_display = fecha_detectada.replace("-", "/")
+            fecha_busqueda = normalizar_fecha_busqueda(fecha_display)
+            
+            st.info(f"📅 **Fecha detectada:** {fecha_display}")
+            
+            df_fecha = df_master[df_master["Fecha"].apply(lambda x: normalizar_fecha_busqueda(x) == fecha_busqueda)].copy()
+            
+            if df_fecha.empty:
+                st.error(f"❌ No se encontraron registros en Google Sheets para la fecha `{fecha_busqueda}`.")
+            else:
+                ups_disponibles = sorted(df_fecha["Unidad_Productiva"].unique())
+                st.success(f"🎯 Se detectaron **{len(ups_disponibles)} Unidades Productivas** disponibles para esta fecha.")
                 
-                textos_paginas = []
+                st.markdown("#### 🏢 Seleccioná las Unidades Productivas a procesar:")
+                with st.container(border=True):
+                    def toggle_all_ups():
+                        estado_maestro = st.session_state.master_select_all
+                        for up_item in ups_disponibles:
+                            st.session_state[f"chk_up_{up_item}"] = estado_maestro
+
+                    st.checkbox("📌 **Seleccionar / Desseleccionar todas**", value=False, key="master_select_all", on_change=toggle_all_ups)
+                    st.divider()
+                    
+                    for up in ups_disponibles:
+                        df_up_temp = df_fecha[df_fecha["Unidad_Productiva"] == up]
+                        cant_personas = len(df_up_temp)
+                        monto_total_up = df_up_temp["Monto"].sum()
+                        monto_fmt = formatear_monto_ar(monto_total_up)
+                        
+                        if st.checkbox(f"**{up}** — *({cant_personas} pagos | Total: {monto_fmt})*", value=False, key=f"chk_up_{up}"):
+                            ups_seleccionadas.append(up)
+    except Exception as e:
+        st.error(f"Error al analizar el PDF: {e}")
+
+# Botón Procesar con Contador Dinámico
+cant_sel = len(ups_seleccionadas)
+sufijo_sel = "seleccionado" if cant_sel == 1 else "seleccionados"
+texto_btn_procesar = f"🚀 Procesar {cant_sel} {sufijo_sel}"
+
+procesar_cliqueado = False
+if doc and ups_seleccionadas:
+    if st.button(texto_btn_procesar, type="primary"):
+        procesar_cliqueado = True
+
+st.divider()
+
+# --- MOTOR DE BÚSQUEDA ESTRICTO BASADO EN MONTO (Ayuda Vagos 3002) ---
+if procesar_cliqueado or "resultados_lotes" in st.session_state:
+    if procesar_cliqueado:
+        with st.spinner("Ejecutando motor estricto por monto y validación de nombres..."):
+            try:
+                paginas_datos = []
                 for i_pag in range(len(doc)):
-                    texto_pag = doc[i_pag].get_text("text")
-                    textos_paginas.append((i_pag, normalizar_texto(texto_pag)))
+                    texto_raw = doc[i_pag].get_text("text")
+                    texto_norm = normalizar_texto(texto_raw)
+                    palabras_pagina = set(texto_norm.split())
+                    
+                    monto_pag = 0.0
+                    match_m = re.search(r"IMPORTE DE LA TRANSFERENCIA:\s*\$?([\d\.,]+)", texto_raw, re.IGNORECASE)
+                    if match_m:
+                        monto_pag = parsear_monto(match_m.group(1))
+                    
+                    paginas_datos.append({
+                        "pag_idx": i_pag,
+                        "texto_norm": texto_norm,
+                        "palabras_pagina": palabras_pagina,
+                        "monto": monto_pag
+                    })
                 
                 resultados_lotes = {}
                 
-                for key_file, info_lote in dict_lotes.items():
-                    df_listado = info_lote["df"]
-                    up_nombre = info_lote["unidad_productiva"]
-                    
-                    encontrados = []
-                    no_encontrados = []
+                for up_nombre in ups_seleccionadas:
+                    df_listado = df_fecha[df_fecha["Unidad_Productiva"] == up_nombre].reset_index(drop=True)
+                    registros_procesados = []
                     
                     for idx, row in df_listado.iterrows():
-                        cuit_orig = str(row.get("CUIT", ""))
+                        cuit_orig = str(row.get("CUIT", "")).strip()
                         nombre_orig = str(row.get("Nombre", "Sin Nombre")).strip()
                         nombre_norm = normalizar_texto(nombre_orig)
                         monto_val = float(row.get("Monto", 0))
                         
-                        monto_entero_str = str(int(monto_val)) if monto_val > 0 else ""
                         hallado = False
+                        num_pagina_encontrada = None
+                        pag_idx_encontrado = None
                         
-                        # CAPA 1: Match Perfecto
-                        for num_pag, texto_norm in textos_paginas:
-                            texto_limpio = texto_norm.replace(".", "").replace(",", "")
-                            montoencontrado = False
-                            if monto_entero_str and len(monto_entero_str) >= 2:
-                                if monto_entero_str in texto_limpio:
-                                    montoencontrado = True
-                            
-                            nombre_encontrado = False
-                            if nombre_norm:
-                                palabras_nombre = [p for p in re.findall(r'\b\w+\b', nombre_norm) if len(p) > 2]
-                                coincidencias = sum(1 for p in palabras_nombre if re.search(r'\b' + re.escape(p) + r'\b', texto_norm))
-                                if palabras_nombre and (coincidencias >= len(palabras_nombre)):
-                                    nombre_encontrado = True
-                            else:
-                                nombre_encontrado = True
-                            
-                            if montoencontrado and nombre_encontrado:
-                                hallado = True
-                                encontrados.append({
-                                    "df_idx": idx,
-                                    "CUIT": cuit_orig,
-                                    "Nombre": nombre_orig,
-                                    "Monto": f"$ {monto_val:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
-                                    "Página PDF": num_pag + 1,
-                                    "Pag_Index": num_pag
-                                })
-                                break
+                        palabras_nombre = [p for p in nombre_norm.split() if len(p) >= 3]
                         
-                        # CAPA 2: Rescate Inteligente por Monto + Fuzzy
-                        if not hallado and monto_entero_str:
-                            for num_pag, texto_norm in textos_paginas:
-                                texto_limpio = texto_norm.replace(".", "").replace(",", "")
-                                if monto_entero_str in texto_limpio:
-                                    titular_pdf, _ = extraer_datos_pagina(doc[num_pag].get_text("text"))
-                                    titular_pdf_norm = normalizar_texto(titular_pdf)
-                                    similitud = calcular_similitud(nombre_norm, titular_pdf_norm)
-                                    if similitud >= 0.50 or any(p in titular_pdf_norm for p in re.findall(r'\b\w+\b', nombre_norm) if len(p) > 3):
+                        # REGLA DE ORO: EL MONTO ES CONDICIÓN OBLIGATORIA
+                        if monto_val > 0:
+                            for pdata in paginas_datos:
+                                if abs(pdata["monto"] - monto_val) <= 0.5:
+                                    coinc_tokens = sum(1 for pn in palabras_nombre if any(similar_palabra_banco(pn, pp) for pp in pdata["palabras_pagina"]))
+                                    
+                                    if not palabras_nombre or coinc_tokens >= min(1, len(palabras_nombre)):
                                         hallado = True
-                                        encontrados.append({
-                                            "df_idx": idx,
-                                            "CUIT": cuit_orig,
-                                            "Nombre": nombre_orig,
-                                            "Monto": f"$ {monto_val:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
-                                            "Página PDF": num_pag + 1,
-                                            "Pag_Index": num_pag
-                                        })
+                                        num_pagina_encontrada = pdata["pag_idx"] + 1
+                                        pag_idx_encontrado = pdata["pag_idx"]
                                         break
                         
-                        # CAPA 3: No Encontrados (Sugerencias)
-                        if not hallado:
-                            sugerencia_pag = None
-                            titular_en_pdf = ""
-                            monto_en_pdf = ""
-                            
-                            if nombre_norm:
-                                palabras_nombre = [p for p in re.findall(r'\b\w+\b', nombre_norm) if len(p) > 2]
-                                for num_pag, texto_norm in textos_paginas:
-                                    coincidencias = sum(1 for p in palabras_nombre if re.search(r'\b' + re.escape(p) + r'\b', texto_norm))
-                                    if palabras_nombre and (coincidencias / len(palabras_nombre)) >= 0.75:
-                                        sugerencia_pag = num_pag + 1
-                                        titular_en_pdf, monto_en_pdf = extraer_datos_pagina(doc[num_pag].get_text("text"))
-                                        break
-                            
-                            no_encontrados.append({
-                                "df_idx": idx,
-                                "CUIT": cuit_orig,
-                                "Nombre": nombre_orig,
-                                "Monto": f"$ {monto_val:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
-                                "Sugerencia_Pag": sugerencia_pag,
-                                "Titular_PDF": titular_en_pdf,
-                                "Monto_PDF": monto_en_pdf
-                            })
+                        monto_fmt_str = formatear_monto_ar(monto_val)
+                        
+                        registros_procesados.append({
+                            "df_idx": idx,
+                            "CUIT": cuit_orig,
+                            "Nombre": nombre_orig,
+                            "Monto": monto_fmt_str,
+                            "Estado": "✅ Encontrado" if hallado else "❌ No encontrado",
+                            "Página PDF": num_pagina_encontrada if hallado else "-",
+                            "Pag_Index": pag_idx_encontrado,
+                            "Encontrado": hallado
+                        })
                     
-                    resultados_lotes[key_file] = {
-                        "unidad_productiva": up_nombre,
-                        "encontrados": encontrados,
-                        "no_encontrados": no_encontrados
-                    }
+                    resultados_lotes[up_nombre] = registros_procesados
                 
                 st.session_state["doc_pdf"] = doc
                 st.session_state["resultados_lotes"] = resultados_lotes
-                st.session_state["fecha_pago"] = fecha_pago
-
+                st.session_state["ups_seleccionadas_activas"] = ups_seleccionadas
+                st.session_state["fecha_pago_str"] = fecha_display.replace("/", "-")
             except Exception as e:
-                st.error(f"Error al procesar: {e}")
+                st.error(f"Error en el procesamiento: {e}")
 
-# --- SECCIÓN 3: RESULTADOS, SUGERENCIAS Y ACCIONES DE EXCEPCIÓN ---
-if "resultados_lotes" in st.session_state:
-    st.subheader("📊 Resultados y Gestión de Excepciones por Unidad Productiva")
-    
-    doc_actual = st.session_state["doc_pdf"]
-    fecha_str = st.session_state["fecha_pago"]
-    
-    titulos_tabs = []
-    keys_lotes = list(st.session_state["resultados_lotes"].keys())
-    
-    for k in keys_lotes:
-        res = st.session_state["resultados_lotes"][k]
-        up = res["unidad_productiva"]
-        tiene_conflictos = len(res["no_encontrados"]) > 0
-        icono = "⚠️" if tiene_conflictos else "✅"
-        titulos_tabs.append(f"{icono} {up}")
+    # --- DESCARGA DE COMPROBANTES ---
+    if "resultados_lotes" in st.session_state:
+        st.markdown("### 📥 Descarga de comprobantes")
+        doc_actual = st.session_state["doc_pdf"]
+        fecha_str = st.session_state["fecha_pago_str"]
         
-    tabs_lotes = st.tabs(titulos_tabs)
-    
-    archivos_pdf_generados = []
-    
-    for idx_tab, key_file in enumerate(keys_lotes):
-        with tabs_lotes[idx_tab]:
-            res_lote = st.session_state["resultados_lotes"][key_file]
-            up_nombre = res_lote["unidad_productiva"]
-            encs = res_lote["encontrados"]
-            no_encs = res_lote["no_encontrados"]
+        keys_lotes = list(st.session_state["resultados_lotes"].keys())
+        titulos_tabs = []
+        for k in keys_lotes:
+            registros = st.session_state["resultados_lotes"][k]
+            total_regs = len(registros)
+            encontrados_regs = sum(1 for r in registros if r["Encontrado"])
+            icono = "✅" if encontrados_regs == total_regs else "⚠️"
+            titulos_tabs.append(f"{icono} {k} ({encontrados_regs}/{total_regs})")
             
-            c1, c2 = st.columns(2)
-            
-            with c1:
-                st.markdown(f"### 🟢 Encontrados ({len(encs)})")
-                if encs:
-                    df_e = pd.DataFrame(sorted(encs, key=lambda x: x["df_idx"])).drop(columns=["df_idx", "Pag_Index"], errors="ignore")
-                    df_e.insert(0, "#", range(1, len(df_e) + 1))
-                    st.dataframe(df_e, use_container_width=True, hide_index=True, column_config=config_columnas)
-                else:
-                    st.info("Sin coincidencias automáticas.")
-            
-            with c2:
-                st.markdown(f"### 🔴 No encontrados / Conflictos ({len(no_encs)})")
-                if no_encs:
-                    st.write("Resolvé los casos pendientes aceptando sugerencias, forzando páginas o descartando:")
+        tabs_lotes = st.tabs(titulos_tabs)
+        
+        for idx_tab, up_nombre in enumerate(keys_lotes):
+            with tabs_lotes[idx_tab]:
+                registros = st.session_state["resultados_lotes"][up_nombre]
+                up_sanitizada = sanitizar_texto_archivo(up_nombre)
+                
+                # Encabezado
+                header_cols = st.columns([0.6, 1.8, 2.5, 1.3, 1.3, 1.2, 1.2])
+                header_cols[0].markdown("**#**")
+                header_cols[1].markdown("**CUIT**")
+                header_cols[2].markdown("**Nombre**")
+                header_cols[3].markdown("**Monto**")
+                header_cols[4].markdown("**Estado**")
+                header_cols[5].markdown("**Pág. PDF**")
+                header_cols[6].markdown("**Acción**")
+                st.divider()
+                
+                # Filas
+                for i, reg in enumerate(registros):
+                    row_cols = st.columns([0.6, 1.8, 2.5, 1.3, 1.3, 1.2, 1.2])
+                    row_cols[0].write(str(i + 1))
+                    row_cols[1].write(reg["CUIT"])
+                    row_cols[2].write(reg["Nombre"])
+                    row_cols[3].write(reg["Monto"])
+                    row_cols[4].write(reg["Estado"])
+                    row_cols[5].write(str(reg["Página PDF"]))
                     
-                    for i_no, item in enumerate(no_encs):
-                        df_idx = item["df_idx"]
-                        nombre = item["Nombre"]
-                        cuit = item["CUIT"]
-                        monto = item["Monto"]
-                        sug_pag = item["Sugerencia_Pag"]
-                        titular_pdf = item["Titular_PDF"]
-                        monto_pdf = item["Monto_PDF"]
+                    with row_cols[6]:
+                        if reg["Encontrado"] and reg["Pag_Index"] is not None:
+                            ind_bytes = generar_pdf_individual_bytes(doc_actual, reg["Pag_Index"])
+                            nombre_persona_san = sanitizar_texto_archivo(reg['Nombre'])
+                            nombre_archivo_ind = f"Comprobante_RI_{up_sanitizada}_{nombre_persona_san}_{fecha_str}.pdf"
+                            st.download_button(
+                                label="⬇️ PDF",
+                                data=ind_bytes,
+                                file_name=nombre_archivo_ind,
+                                mime="application/pdf",
+                                key=f"dl_ind_{up_nombre}_{i}"
+                            )
+                        else:
+                            st.write("—")
+                
+                st.divider()
+                
+                # Opciones de descarga de UP
+                st.markdown("#### 📥 Opciones de Descarga para esta Unidad Productiva")
+                
+                registros_validos = [r for r in registros if r["Encontrado"] and r["Pag_Index"] is not None]
+                
+                if registros_validos:
+                    col_d1, col_d2 = st.columns(2)
+                    
+                    with col_d1:
+                        indices_up = [r["Pag_Index"] for r in registros_validos]
+                        pdf_uni_bytes = generar_pdf_unificado_bytes(doc_actual, indices_up)
+                        nombre_archivo_uni = f"Comprobantes_RI_{up_sanitizada}_{fecha_str}.pdf"
+                        st.download_button(
+                            label=f"📄 Descargar PDF Único ({up_nombre})",
+                            data=pdf_uni_bytes,
+                            file_name=nombre_archivo_uni,
+                            mime="application/pdf",
+                            key=f"dl_uni_{up_nombre}"
+                        )
+                    
+                    with col_d2:
+                        zip_buffer = io.BytesIO()
+                        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                            for r in registros_validos:
+                                p_idx = r["Pag_Index"]
+                                n_per = sanitizar_texto_archivo(r["Nombre"])
+                                nombre_f = f"Comprobante_RI_{up_sanitizada}_{n_per}_{fecha_str}.pdf"
+                                single_bytes = generar_pdf_individual_bytes(doc_actual, p_idx)
+                                zip_file.writestr(nombre_f, single_bytes)
+                        zip_buffer.seek(0)
                         
-                        with st.container():
-                            if sug_pag:
-                                st.warning(f"⚠️ **{nombre}** — Posible coincidencia en Pág. {sug_pag}")
-                                # gap="small" y proporciones equilibradas para alinear texto y botón perfectamente
-                                col_txt_sug, col_btn_sug = st.columns([3.5, 2.5], gap="small")
-                                with col_txt_sug:
-                                    st.markdown(f"<div style='padding-top: 6px;'>💡 <b>Titular PDF:</b> {titular_pdf} &nbsp;|&nbsp; <b>Monto PDF:</b> $ {monto_pdf}</div>", unsafe_allow_html=True)
-                                with col_btn_sug:
-                                    if st.button(f"➕ Aceptar Sugerencia (Pág. {sug_pag})", key=f"btn_sug_{key_file}_{i_no}"):
-                                        p_idx = sug_pag - 1
-                                        st.session_state["resultados_lotes"][key_file]["encontrados"].append({
-                                            "df_idx": df_idx,
-                                            "CUIT": cuit,
-                                            "Nombre": nombre,
-                                            "Monto": monto,
-                                            "Página PDF": sug_pag,
-                                            "Pag_Index": p_idx
-                                        })
-                                        st.session_state["resultados_lotes"][key_file]["no_encontrados"].pop(i_no)
-                                        st.rerun()
-                            else:
-                                st.error(f"❌ **{nombre}** — Sin coincidencias automáticas")
-                            
-                            # Uso de gap="small" para eliminar el espacio excesivo entre controles
-                            col_input, col_btn_forzar, col_btn_omitir = st.columns([2, 2, 2], gap="small")
-                            with col_input:
-                                pag_manual = st.number_input(
-                                    f"N° Pág manual para {nombre}", 
-                                    min_value=1, 
-                                    max_value=len(doc_actual), 
-                                    value=sug_pag if sug_pag else 1, 
-                                    key=f"input_pag_{key_file}_{i_no}",
-                                    label_visibility="collapsed"
-                                )
-                            with col_btn_forzar:
-                                if st.button("➕ Forzar Página", key=f"btn_forzar_{key_file}_{i_no}"):
-                                    p_idx = int(pag_manual) - 1
-                                    st.session_state["resultados_lotes"][key_file]["encontrados"].append({
-                                        "df_idx": df_idx,
-                                        "CUIT": cuit,
-                                        "Nombre": nombre,
-                                        "Monto": monto,
-                                        "Página PDF": int(pag_manual),
-                                        "Pag_Index": p_idx
-                                    })
-                                    st.session_state["resultados_lotes"][key_file]["no_encontrados"].pop(i_no)
-                                    st.rerun()
-                            with col_btn_omitir:
-                                if st.button("🗑️ Descartar", key=f"btn_omitir_{key_file}_{i_no}"):
-                                    st.session_state["resultados_lotes"][key_file]["no_encontrados"].pop(i_no)
-                                    st.rerun()
-                            st.divider()
+                        st.download_button(
+                            label=f"🗂️ Descargar ZIP Separados ({up_nombre})",
+                            data=zip_buffer,
+                            file_name=f"ZIP_Comprobantes_{up_sanitizada}_{fecha_str}.zip",
+                            mime="application/zip",
+                            key=f"dl_zip_{up_nombre}"
+                        )
                 else:
-                    st.success("¡100% de coincidencias confirmadas o descartadas!")
-            
-            # Generar PDF individual para descarga
-            if encs:
-                pdf_individual = fitz.open()
-                encs_sorted = sorted(encs, key=lambda x: x["df_idx"])
-                for item in encs_sorted:
-                    p = item["Pag_Index"]
-                    pdf_individual.insert_pdf(doc_actual, from_page=p, to_page=p)
-                
-                pdf_out_bytes = pdf_individual.write()
-                nombre_pdf_salida = f"Comprobantes RI - {up_nombre} ({fecha_str}).pdf"
-                
-                archivos_pdf_generados.append({
-                    "filename": nombre_pdf_salida,
-                    "bytes": pdf_out_bytes
-                })
-                
-                st.download_button(
-                    label=f"📥 Descargar PDF para {up_nombre}",
-                    data=pdf_out_bytes,
-                    file_name=nombre_pdf_salida,
-                    mime="application/pdf",
-                    key=f"down_single_{key_file}"
-                )
+                    st.info("No hay comprobantes encontrados para generar descargas en esta UP.")
 
-    # --- SECCIÓN FINAL: DESCARGA ZIP ---
-    if archivos_pdf_generados:
+        # Descarga Masiva Multi-UP
         st.markdown("---")
-        st.markdown("### 📦 Descarga Completa por Lote")
+        ups_activas_count = len(st.session_state.get("ups_seleccionadas_activas", keys_lotes))
         
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-            for item in archivos_pdf_generados:
-                zip_file.writestr(item["filename"], item["bytes"])
+        zip_masivo_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_masivo_buffer, "w", zipfile.ZIP_DEFLATED) as zip_masivo:
+            for up_n, regs in st.session_state["resultados_lotes"].items():
+                up_san = sanitizar_texto_archivo(up_n)
+                for r in regs:
+                    if r["Encontrado"] and r["Pag_Index"] is not None:
+                        p_idx = r["Pag_Index"]
+                        n_per = sanitizar_texto_archivo(r["Nombre"])
+                        nombre_f = f"Comprobante_RI_{up_san}_{n_per}_{fecha_str}.pdf"
+                        single_bytes = generar_pdf_individual_bytes(doc_actual, p_idx)
+                        path_en_zip = f"{up_n}/{nombre_f}"
+                        zip_masivo.writestr(path_en_zip, single_bytes)
+        zip_masivo_buffer.seek(0)
         
-        zip_buffer.seek(0)
-        
-        # Uso de gap="small" para mantener juntos el botón de ZIP y el de reiniciar
-        col_zip, col_reset = st.columns([2, 1], gap="small")
-        with col_zip:
-            st.download_button(
-                label="📦 Descargar TODOS los PDFs en un .ZIP",
-                data=zip_buffer,
-                file_name=f"Comprobantes_RI_Lote_({fecha_str}).zip",
-                mime="application/zip",
-                type="primary"
-            )
-        with col_reset:
-            if st.button("🔄 Reiniciar Todo", type="secondary"):
-                st.session_state["reset_count"] += 1
-                for k in list(st.session_state.keys()):
-                    if k != "reset_count":
-                        del st.session_state[k]
-                st.rerun()
+        st.download_button(
+            label=f"📦 Descargar comprobantes de {ups_activas_count} UPs seleccionadas",
+            data=zip_masivo_buffer,
+            file_name=f"ZIP_Masivo_Todas_UPs_{fecha_str}.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True
+        )
+
+# --- BOTÓN DE REINICIO ABAJO DE TODO ---
+st.markdown("---")
+col_reset1, col_reset2, col_reset3 = st.columns([1, 2, 1])
+with col_reset2:
+    if st.button("🔄 Reiniciar aplicación", type="secondary", use_container_width=True):
+        st.session_state["reset_count"] += 1
+        keys_to_clear = ["doc_pdf", "resultados_lotes", "ups_seleccionadas_activas", "fecha_pago_str"]
+        for k in keys_to_clear:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
